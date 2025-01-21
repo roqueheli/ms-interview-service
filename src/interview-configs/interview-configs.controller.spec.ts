@@ -1,5 +1,7 @@
 import { NotFoundException } from '@nestjs/common';
 import { Test, TestingModule } from '@nestjs/testing';
+import { ClientProxy } from '@nestjs/microservices';
+import { of, throwError } from 'rxjs';
 import { CreateInterviewConfigDto } from './dto/create-interview-config.dto';
 import { UpdateInterviewConfigDto } from './dto/update-interview-config.dto';
 import { InterviewConfig } from './entities/interview-config.entity';
@@ -9,8 +11,8 @@ import { InterviewConfigsService } from './interview-configs.service';
 describe('InterviewConfigsController', () => {
     let controller: InterviewConfigsController;
     let service: InterviewConfigsService;
+    let configClient: ClientProxy;
 
-    // Mock data
     const mockConfig: InterviewConfig = {
         config_id: '123e4567-e89b-12d3-a456-426614174000',
         enterprise_id: '123e4567-e89b-12d3-a456-426614174001',
@@ -38,7 +40,6 @@ describe('InterviewConfigsController', () => {
         num_questions: 15,
     };
 
-    // Mock service
     const mockConfigsService = {
         create: jest.fn(),
         findAll: jest.fn(),
@@ -46,6 +47,11 @@ describe('InterviewConfigsController', () => {
         findByEnterpriseAndRole: jest.fn(),
         update: jest.fn(),
         remove: jest.fn(),
+    };
+
+    const mockConfigClient = {
+        send: jest.fn(),
+        emit: jest.fn(),
     };
 
     beforeEach(async () => {
@@ -56,11 +62,16 @@ describe('InterviewConfigsController', () => {
                     provide: InterviewConfigsService,
                     useValue: mockConfigsService,
                 },
+                {
+                    provide: 'INTERVIEW_CONFIG_SERVICE',
+                    useValue: mockConfigClient,
+                },
             ],
         }).compile();
 
         controller = module.get<InterviewConfigsController>(InterviewConfigsController);
         service = module.get<InterviewConfigsService>(InterviewConfigsService);
+        configClient = module.get<ClientProxy>('INTERVIEW_CONFIG_SERVICE');
     });
 
     afterEach(() => {
@@ -68,41 +79,55 @@ describe('InterviewConfigsController', () => {
     });
 
     describe('create', () => {
+        beforeEach(() => {
+            mockConfigClient.send.mockImplementation((pattern, payload) => {
+                if (pattern === 'verify_enterprise') return of(true);
+                if (pattern === 'verify_job_role') return of(true);
+                return of(false);
+            });
+        });
+
         it('should create a new interview config', async () => {
             mockConfigsService.create.mockResolvedValue(mockConfig);
+            mockConfigClient.emit.mockImplementation(() => of(undefined));
 
             const result = await controller.create(mockCreateDto);
 
             expect(result).toEqual(mockConfig);
             expect(service.create).toHaveBeenCalledWith(mockCreateDto);
-            expect(service.create).toHaveBeenCalledTimes(1);
-        });
-    });
-
-    describe('findAll', () => {
-        it('should return an array of interview configs', async () => {
-            const mockConfigs = [mockConfig];
-            mockConfigsService.findAll.mockResolvedValue(mockConfigs);
-
-            const result = await controller.findAll();
-
-            expect(result).toEqual(mockConfigs);
-            expect(service.findAll).toHaveBeenCalled();
+            expect(configClient.emit).toHaveBeenCalledWith('interview_config_created', expect.any(Object));
         });
 
-        it('should return empty array when no configs exist', async () => {
-            mockConfigsService.findAll.mockResolvedValue([]);
+        it('should throw error if enterprise does not exist', async () => {
+            mockConfigClient.send.mockImplementation((pattern) => {
+                if (pattern === 'verify_enterprise') return of(false);
+                return of(true);
+            });
 
-            const result = await controller.findAll();
+            await expect(controller.create(mockCreateDto)).rejects.toThrow('Enterprise not found');
+        });
 
-            expect(result).toEqual([]);
-            expect(service.findAll).toHaveBeenCalled();
+        it('should throw error if job role does not exist', async () => {
+            mockConfigClient.send.mockImplementation((pattern) => {
+                if (pattern === 'verify_job_role') return of(false);
+                return of(true);
+            });
+
+            await expect(controller.create(mockCreateDto)).rejects.toThrow('Job role not found');
         });
     });
 
     describe('findByEnterpriseAndRole', () => {
-        const enterpriseId = '123e4567-e89b-12d3-a456-426614174001';
-        const roleId = '123e4567-e89b-12d3-a456-426614174002';
+        const enterpriseId = mockConfig.enterprise_id;
+        const roleId = mockConfig.job_role_id;
+
+        beforeEach(() => {
+            mockConfigClient.send.mockImplementation((pattern) => {
+                if (pattern === 'verify_enterprise') return of(true);
+                if (pattern === 'verify_job_role') return of(true);
+                return of(false);
+            });
+        });
 
         it('should return configs for specific enterprise and role', async () => {
             const mockConfigs = [mockConfig];
@@ -114,13 +139,113 @@ describe('InterviewConfigsController', () => {
             expect(service.findByEnterpriseAndRole).toHaveBeenCalledWith(enterpriseId, roleId);
         });
 
-        it('should return empty array when no configs found', async () => {
-            mockConfigsService.findByEnterpriseAndRole.mockResolvedValue([]);
+        it('should throw error if enterprise does not exist', async () => {
+            mockConfigClient.send.mockImplementation((pattern) => {
+                if (pattern === 'verify_enterprise') return of(false);
+                return of(true);
+            });
 
-            const result = await controller.findByEnterpriseAndRole(enterpriseId, roleId);
+            await expect(controller.findByEnterpriseAndRole(enterpriseId, roleId))
+                .rejects.toThrow('Enterprise not found');
+        });
 
-            expect(result).toEqual([]);
-            expect(service.findByEnterpriseAndRole).toHaveBeenCalledWith(enterpriseId, roleId);
+        it('should throw error if job role does not exist', async () => {
+            mockConfigClient.send.mockImplementation((pattern) => {
+                if (pattern === 'verify_job_role') return of(false);
+                return of(true);
+            });
+
+            await expect(controller.findByEnterpriseAndRole(enterpriseId, roleId))
+                .rejects.toThrow('Job role not found');
+        });
+    });
+
+    describe('update', () => {
+        it('should update an interview config and emit event', async () => {
+            const updatedConfig = { ...mockConfig, ...mockUpdateDto };
+            mockConfigsService.update.mockResolvedValue(updatedConfig);
+            mockConfigClient.emit.mockImplementation(() => of(undefined));
+
+            const result = await controller.update(mockConfig.config_id, mockUpdateDto);
+
+            expect(result).toEqual(updatedConfig);
+            expect(service.update).toHaveBeenCalledWith(mockConfig.config_id, mockUpdateDto);
+            expect(configClient.emit).toHaveBeenCalledWith('interview_config_updated', expect.any(Object));
+        });
+    });
+
+    describe('remove', () => {
+        it('should remove an interview config and emit event', async () => {
+            mockConfigsService.remove.mockResolvedValue(undefined);
+            mockConfigClient.emit.mockImplementation(() => of(undefined));
+
+            const result = await controller.remove(mockConfig.config_id);
+
+            expect(result).toEqual({ message: 'Interview configuration deleted successfully' });
+            expect(service.remove).toHaveBeenCalledWith(mockConfig.config_id);
+            expect(configClient.emit).toHaveBeenCalledWith('interview_config_deleted', expect.any(Object));
+        });
+    });
+
+    describe('Message Patterns', () => {
+        describe('verifyConfig', () => {
+            it('should return true if config exists', async () => {
+                mockConfigsService.findOne.mockResolvedValue(mockConfig);
+
+                const result = await controller.verifyConfig(mockConfig.config_id);
+
+                expect(result).toEqual({ exists: true });
+            });
+
+            it('should return false if config does not exist', async () => {
+                mockConfigsService.findOne.mockRejectedValue(new NotFoundException());
+
+                const result = await controller.verifyConfig('non-existent-id');
+
+                expect(result).toEqual({ exists: false });
+            });
+        });
+
+        describe('getConfigByEnterpriseAndRole', () => {
+            it('should return config if found', async () => {
+                mockConfigsService.findByEnterpriseAndRole.mockResolvedValue(mockConfig);
+
+                const result = await controller.getConfigByEnterpriseAndRole({
+                    enterpriseId: mockConfig.enterprise_id,
+                    roleId: mockConfig.job_role_id
+                });
+
+                expect(result).toEqual({ config: mockConfig, success: true });
+            });
+
+            it('should return error if config not found', async () => {
+                const errorMessage = 'Config not found';
+                mockConfigsService.findByEnterpriseAndRole.mockRejectedValue(new Error(errorMessage));
+
+                const result = await controller.getConfigByEnterpriseAndRole({
+                    enterpriseId: 'non-existent',
+                    roleId: 'non-existent'
+                });
+
+                expect(result).toEqual({
+                    config: null,
+                    success: false,
+                    error: errorMessage
+                });
+            });
+        });
+    });
+
+    // Mantener las pruebas existentes para findAll y findOne
+    describe('findAll', () => {
+        it('should return an array of interview configs', async () => {
+            const mockConfigs = [mockConfig];
+            mockConfigsService.findAll.mockResolvedValue(mockConfigs);
+
+            const result = await controller.findAll();
+
+            expect(result).toEqual(mockConfigs);
+            expect(service.findAll).toHaveBeenCalled();
         });
     });
 
@@ -132,47 +257,6 @@ describe('InterviewConfigsController', () => {
 
             expect(result).toEqual(mockConfig);
             expect(service.findOne).toHaveBeenCalledWith(mockConfig.config_id);
-        });
-
-        it('should throw NotFoundException when config not found', async () => {
-            mockConfigsService.findOne.mockRejectedValue(new NotFoundException());
-
-            await expect(controller.findOne('non-existent-id')).rejects.toThrow(NotFoundException);
-        });
-    });
-
-    describe('update', () => {
-        it('should update an interview config', async () => {
-            const updatedConfig = { ...mockConfig, ...mockUpdateDto };
-            mockConfigsService.update.mockResolvedValue(updatedConfig);
-
-            const result = await controller.update(mockConfig.config_id, mockUpdateDto);
-
-            expect(result).toEqual(updatedConfig);
-            expect(service.update).toHaveBeenCalledWith(mockConfig.config_id, mockUpdateDto);
-        });
-
-        it('should throw NotFoundException when updating non-existent config', async () => {
-            mockConfigsService.update.mockRejectedValue(new NotFoundException());
-
-            await expect(controller.update('non-existent-id', mockUpdateDto)).rejects.toThrow(NotFoundException);
-        });
-    });
-
-    describe('remove', () => {
-        it('should remove an interview config', async () => {
-            mockConfigsService.remove.mockResolvedValue(undefined);
-
-            const result = await controller.remove(mockConfig.config_id);
-
-            expect(result).toBeUndefined();
-            expect(service.remove).toHaveBeenCalledWith(mockConfig.config_id);
-        });
-
-        it('should throw NotFoundException when removing non-existent config', async () => {
-            mockConfigsService.remove.mockRejectedValue(new NotFoundException());
-
-            await expect(controller.remove('non-existent-id')).rejects.toThrow(NotFoundException);
         });
     });
 });

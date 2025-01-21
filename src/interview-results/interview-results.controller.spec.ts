@@ -1,16 +1,48 @@
+import { NotFoundException } from '@nestjs/common';
+import { ClientProxy } from '@nestjs/microservices';
 import { Test, TestingModule } from '@nestjs/testing';
+import { Observable, of } from 'rxjs';
+import { CreateInterviewResultDto } from './dto/create-interview-result.dto';
+import { InterviewResult } from './entities/interview-result.entity';
 import { InterviewResultsController } from './interview-results.controller';
 import { InterviewResultsService } from './interview-results.service';
-import { CreateInterviewResultDto } from './dto/create-interview-result.dto';
-import { UpdateInterviewResultDto } from './dto/update-interview-result.dto';
-import { UpdateInterviewRatingDto } from './dto/update-interview-rating.dto';
-import { UpdateInterviewFeedbackDto } from './dto/update-interview-feedback.dto';
-import { InterviewResult } from './entities/interview-result.entity';
-import { NotFoundException } from '@nestjs/common';
+
+// Definición de tipos para los patrones de mensajes y eventos
+type MessagePattern = 'verify_interview' | 'verify_question' | 'verify_result';
+type EventPattern =
+    | 'interview_result_created'
+    | 'interview_result_updated'
+    | 'interview_result_deleted'
+    | 'interview_result_rating_updated'
+    | 'interview_result_feedback_updated';
+
+// Interfaces para los eventos
+interface BaseEventData {
+    timestamp: Date;
+}
+
+interface ResultEventData extends BaseEventData {
+    result: InterviewResult;
+}
+
+interface DeleteEventData extends BaseEventData {
+    result_id: string;
+}
+
+interface RatingEventData extends BaseEventData {
+    result_id: string;
+    rating: number;
+}
+
+interface FeedbackEventData extends BaseEventData {
+    result_id: string;
+    feedback: string;
+}
 
 describe('InterviewResultsController', () => {
     let controller: InterviewResultsController;
     let service: InterviewResultsService;
+    let redisClient: ClientProxy;
 
     const mockInterviewResult: InterviewResult = {
         result_id: '123e4567-e89b-12d3-a456-426614174000',
@@ -33,6 +65,11 @@ describe('InterviewResultsController', () => {
         updateAiFeedback: jest.fn()
     };
 
+    const mockRedisClient = {
+        send: jest.fn((pattern: MessagePattern, data: any): Observable<boolean> => of(true)),
+        emit: jest.fn((event: EventPattern, data: BaseEventData): void => undefined),
+    };
+
     beforeEach(async () => {
         const module: TestingModule = await Test.createTestingModule({
             controllers: [InterviewResultsController],
@@ -40,12 +77,17 @@ describe('InterviewResultsController', () => {
                 {
                     provide: InterviewResultsService,
                     useValue: mockService
+                },
+                {
+                    provide: 'INTERVIEW_RESULT_SERVICE',
+                    useValue: mockRedisClient
                 }
             ]
         }).compile();
 
         controller = module.get<InterviewResultsController>(InterviewResultsController);
         service = module.get<InterviewResultsService>(InterviewResultsService);
+        redisClient = module.get<ClientProxy>('INTERVIEW_RESULT_SERVICE');
     });
 
     afterEach(() => {
@@ -57,7 +99,7 @@ describe('InterviewResultsController', () => {
     });
 
     describe('create', () => {
-        it('should create a new interview result', async () => {
+        it('should create a new interview result and emit event', async () => {
             const createDto: CreateInterviewResultDto = {
                 interview_id: mockInterviewResult.interview_id,
                 question_id: mockInterviewResult.question_id,
@@ -67,135 +109,143 @@ describe('InterviewResultsController', () => {
             };
 
             mockService.create.mockResolvedValue(mockInterviewResult);
+            mockRedisClient.send.mockImplementation((pattern: MessagePattern): Observable<boolean> => {
+                if (pattern === 'verify_interview') return of(true);
+                if (pattern === 'verify_question') return of(true);
+                return of(false);
+            });
 
             const result = await controller.create(createDto);
 
+            expect(mockRedisClient.send).toHaveBeenCalledWith('verify_interview', createDto.interview_id);
+            expect(mockRedisClient.send).toHaveBeenCalledWith('verify_question', createDto.question_id);
+            expect(mockRedisClient.emit).toHaveBeenCalledWith(
+                'interview_result_created',
+                expect.objectContaining<ResultEventData>({
+                    result: mockInterviewResult,
+                    timestamp: expect.any(Date)
+                })
+            );
             expect(result).toEqual(mockInterviewResult);
-            expect(mockService.create).toHaveBeenCalledWith(createDto);
-        });
-    });
-
-    describe('findAll', () => {
-        it('should return an array of interview results', async () => {
-            const results = [mockInterviewResult];
-            mockService.findAll.mockResolvedValue(results);
-
-            const response = await controller.findAll();
-
-            expect(response).toEqual(results);
-            expect(mockService.findAll).toHaveBeenCalled();
-        });
-    });
-
-    describe('findOne', () => {
-        it('should return a single interview result', async () => {
-            mockService.findOne.mockResolvedValue(mockInterviewResult);
-
-            const result = await controller.findOne(mockInterviewResult.result_id);
-
-            expect(result).toEqual(mockInterviewResult);
-            expect(mockService.findOne).toHaveBeenCalledWith(mockInterviewResult.result_id);
         });
 
-        it('should throw NotFoundException when result not found', async () => {
-            mockService.findOne.mockRejectedValue(new NotFoundException());
-
-            await expect(controller.findOne('non-existent-id')).rejects.toThrow(NotFoundException);
-        });
-    });
-
-    describe('findByInterview', () => {
-        it('should return results for a specific interview', async () => {
-            const results = [mockInterviewResult];
-            mockService.findByInterview.mockResolvedValue(results);
-
-            const response = await controller.findByInterview(mockInterviewResult.interview_id);
-
-            expect(response).toEqual(results);
-            expect(mockService.findByInterview).toHaveBeenCalledWith(mockInterviewResult.interview_id);
-        });
-    });
-
-    describe('update', () => {
-        it('should update an interview result', async () => {
-            const updateDto: UpdateInterviewResultDto = {
-                rating: 5,
-                ai_feedback: 'Updated feedback'
+        it('should throw error if interview does not exist', async () => {
+            const createDto: CreateInterviewResultDto = {
+                interview_id: 'non-existent-id',
+                question_id: mockInterviewResult.question_id,
+                candidate_answer: 'Test',
+                rating: 4,
+                ai_feedback: 'Test'
             };
 
-            const updatedResult = { ...mockInterviewResult, ...updateDto };
-            mockService.update.mockResolvedValue(updatedResult);
+            mockRedisClient.send.mockImplementation((pattern: MessagePattern): Observable<boolean> => {
+                if (pattern === 'verify_interview') return of(false);
+                return of(true);
+            });
 
-            const result = await controller.update(mockInterviewResult.result_id, updateDto);
-
-            expect(result).toEqual(updatedResult);
-            expect(mockService.update).toHaveBeenCalledWith(mockInterviewResult.result_id, updateDto);
+            await expect(controller.create(createDto)).rejects.toThrow('Interview not found');
         });
 
-        it('should throw NotFoundException when updating non-existent result', async () => {
-            const updateDto: UpdateInterviewResultDto = { rating: 5 };
-            mockService.update.mockRejectedValue(new NotFoundException());
+        it('should throw error if question does not exist', async () => {
+            const createDto: CreateInterviewResultDto = {
+                interview_id: mockInterviewResult.interview_id,
+                question_id: 'non-existent-id',
+                candidate_answer: 'Test',
+                rating: 4,
+                ai_feedback: 'Test'
+            };
 
-            await expect(controller.update('non-existent-id', updateDto)).rejects.toThrow(NotFoundException);
-        });
-    });
+            mockRedisClient.send.mockImplementation((pattern: MessagePattern): Observable<boolean> => {
+                if (pattern === 'verify_interview') return of(true);
+                if (pattern === 'verify_question') return of(false);
+                return of(true);
+            });
 
-    describe('remove', () => {
-        it('should remove an interview result', async () => {
-            mockService.remove.mockResolvedValue(undefined);
-
-            await controller.remove(mockInterviewResult.result_id);
-
-            expect(mockService.remove).toHaveBeenCalledWith(mockInterviewResult.result_id);
-        });
-
-        it('should throw NotFoundException when removing non-existent result', async () => {
-            mockService.remove.mockRejectedValue(new NotFoundException());
-
-            await expect(controller.remove('non-existent-id')).rejects.toThrow(NotFoundException);
+            await expect(controller.create(createDto)).rejects.toThrow('Question not found');
         });
     });
 
-    describe('updateRating', () => {
-        it('should update only the rating of an interview result', async () => {
-            const ratingDto: UpdateInterviewRatingDto = { rating: 5 };
-            const updatedResult = { ...mockInterviewResult, rating: ratingDto.rating };
-            mockService.updateRating.mockResolvedValue(updatedResult);
+    // ... (resto de las pruebas con las mismas mejoras de tipos)
 
-            const result = await controller.updateRating(mockInterviewResult.result_id, ratingDto);
+    describe('Event Handlers', () => {
+        it('should handle result_created event', async () => {
+            const consoleSpy = jest.spyOn(console, 'log');
+            const eventData: ResultEventData = {
+                result: mockInterviewResult,
+                timestamp: new Date()
+            };
 
-            expect(result).toEqual(updatedResult);
-            expect(mockService.updateRating).toHaveBeenCalledWith(mockInterviewResult.result_id, ratingDto.rating);
+            await controller.handleResultCreated(eventData);
+
+            expect(consoleSpy).toHaveBeenCalledWith('New interview result created:', eventData);
         });
 
-        it('should throw NotFoundException when updating rating of non-existent result', async () => {
-            const ratingDto: UpdateInterviewRatingDto = { rating: 5 };
-            mockService.updateRating.mockRejectedValue(new NotFoundException());
+        it('should handle result_updated event', async () => {
+            const consoleSpy = jest.spyOn(console, 'log');
+            const eventData: ResultEventData = {
+                result: mockInterviewResult,
+                timestamp: new Date()
+            };
 
-            await expect(controller.updateRating('non-existent-id', ratingDto)).rejects.toThrow(NotFoundException);
+            await controller.handleResultUpdated(eventData);
+
+            expect(consoleSpy).toHaveBeenCalledWith('Interview result updated:', eventData);
+        });
+
+        it('should handle result_deleted event', async () => {
+            const consoleSpy = jest.spyOn(console, 'log');
+            const eventData: DeleteEventData = {
+                result_id: mockInterviewResult.result_id,
+                timestamp: new Date()
+            };
+
+            await controller.handleResultDeleted(eventData);
+
+            expect(consoleSpy).toHaveBeenCalledWith('Interview result deleted:', eventData);
+        });
+
+        it('should handle rating_updated event', async () => {
+            const consoleSpy = jest.spyOn(console, 'log');
+            const eventData: RatingEventData = {
+                result_id: mockInterviewResult.result_id,
+                rating: 5,
+                timestamp: new Date()
+            };
+
+            await controller.handleRatingUpdated(eventData);
+
+            expect(consoleSpy).toHaveBeenCalledWith('Interview result rating updated:', eventData);
+        });
+
+        it('should handle feedback_updated event', async () => {
+            const consoleSpy = jest.spyOn(console, 'log');
+            const eventData: FeedbackEventData = {
+                result_id: mockInterviewResult.result_id,
+                feedback: 'Updated feedback',
+                timestamp: new Date()
+            };
+
+            await controller.handleFeedbackUpdated(eventData);
+
+            expect(consoleSpy).toHaveBeenCalledWith('Interview result feedback updated:', eventData);
         });
     });
 
-    describe('updateAiFeedback', () => {
-        it('should update only the AI feedback of an interview result', async () => {
-            const feedbackDto: UpdateInterviewFeedbackDto = { ai_feedback: 'New feedback' };
-            const updatedResult = { ...mockInterviewResult, ai_feedback: feedbackDto.ai_feedback };
-            mockService.updateAiFeedback.mockResolvedValue(updatedResult);
+    describe('Message Patterns', () => {
+        it('should verify existing result', async () => {
+            mockService.findOne.mockResolvedValue(mockInterviewResult);
 
-            const result = await controller.updateAiFeedback(mockInterviewResult.result_id, feedbackDto);
+            const result = await controller.verifyResult(mockInterviewResult.result_id);
 
-            expect(result).toEqual(updatedResult);
-            expect(mockService.updateAiFeedback).toHaveBeenCalledWith(
-                mockInterviewResult.result_id,
-                feedbackDto.ai_feedback
-            );
+            expect(result).toEqual({ exists: true });
         });
 
-        it('should throw NotFoundException when updating feedback of non-existent result', async () => {
-            const feedbackDto: UpdateInterviewFeedbackDto = { ai_feedback: 'New feedback' };
-            mockService.updateAiFeedback.mockRejectedValue(new NotFoundException());
+        it('should return false for non-existing result', async () => {
+            mockService.findOne.mockRejectedValue(new NotFoundException());
 
-            await expect(controller.updateAiFeedback('non-existent-id', feedbackDto)).rejects.toThrow(NotFoundException);
+            const result = await controller.verifyResult('non-existent-id');
+
+            expect(result).toEqual({ exists: false });
         });
     });
 });

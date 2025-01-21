@@ -1,14 +1,34 @@
-// main.spec.ts
 import { INestApplication, ValidationPipe } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
+import { MicroserviceOptions, Transport } from '@nestjs/microservices';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 import { AppModule } from './app.module';
+import { redisConfig } from './config/redis.config';
 import { bootstrap } from './main';
 
 // Mock de los módulos externos
 jest.mock('@nestjs/core', () => ({
     NestFactory: {
         create: jest.fn(),
+    },
+}));
+
+// Mock de ConfigService
+const mockConfigService = {
+    get: jest.fn().mockImplementation((key: string, defaultValue: any) => {
+        const config = {
+            PORT: '3003',
+            CORS_ORIGIN: 'http://localhost:3000',
+        };
+        return config[key] || defaultValue;
+    }),
+};
+
+// Mock de redisConfig
+jest.mock('./config/redis.config', () => ({
+    redisConfig: {
+        host: 'localhost',
+        port: 6380,
     },
 }));
 
@@ -36,8 +56,6 @@ jest.mock('./app.module', () => ({
 
 describe('Bootstrap', () => {
     let app: INestApplication;
-    const mockPort = '3003';
-    const mockCorsOrigin = 'http://localhost:3000';
     let documentBuilder: MockDocumentBuilder;
     let swaggerDocument: any;
 
@@ -45,10 +63,13 @@ describe('Bootstrap', () => {
         jest.clearAllMocks();
 
         app = {
-            setGlobalPrefix: jest.fn(),
-            useGlobalPipes: jest.fn(),
-            enableCors: jest.fn(),
+            setGlobalPrefix: jest.fn().mockReturnThis(),
+            useGlobalPipes: jest.fn().mockReturnThis(),
+            enableCors: jest.fn().mockReturnThis(),
             listen: jest.fn().mockResolvedValue(undefined),
+            connectMicroservice: jest.fn().mockReturnThis(),
+            startAllMicroservices: jest.fn().mockResolvedValue(undefined),
+            get: jest.fn().mockReturnValue(mockConfigService),
         } as any;
 
         documentBuilder = new MockDocumentBuilder();
@@ -64,10 +85,33 @@ describe('Bootstrap', () => {
 
         jest.spyOn(console, 'log').mockImplementation();
 
-        process.env.PORT = mockPort;
-        process.env.CORS_ORIGIN = mockCorsOrigin;
-
         (NestFactory.create as jest.Mock).mockResolvedValue(app);
+    });
+
+    describe('Redis Configuration', () => {
+        it('should configure Redis microservice', async () => {
+            await bootstrap();
+
+            expect(app.connectMicroservice).toHaveBeenCalledWith<[MicroserviceOptions]>({
+                transport: Transport.REDIS,
+                options: {
+                    host: redisConfig.host,
+                    port: redisConfig.port,
+                },
+            });
+        });
+
+        it('should start microservices', async () => {
+            await bootstrap();
+
+            expect(app.startAllMicroservices).toHaveBeenCalled();
+        });
+
+        it('should log Redis microservice status', async () => {
+            await bootstrap();
+
+            expect(console.log).toHaveBeenCalledWith('📮 Redis microservice is running');
+        });
     });
 
     describe('Application Setup', () => {
@@ -83,36 +127,45 @@ describe('Bootstrap', () => {
 
         it('should configure validation pipe', async () => {
             await bootstrap();
+            expect(app.useGlobalPipes).toHaveBeenCalledWith(
+                expect.any(ValidationPipe)
+            );
+        });
 
-            // Verificar que useGlobalPipes fue llamado
-            expect(app.useGlobalPipes).toHaveBeenCalled();
-
-            // Obtener el ValidationPipe que se pasó a useGlobalPipes
+        it('should configure validation pipe with correct options', async () => {
+            await bootstrap();
             const [validationPipe] = (app.useGlobalPipes as jest.Mock).mock.calls[0];
-
-            // Verificar que es una instancia de ValidationPipe
             expect(validationPipe).toBeInstanceOf(ValidationPipe);
 
-            // Verificar que se creó con las opciones correctas
-            const validationPipeStr = JSON.stringify(validationPipe);
-            expect(validationPipeStr).toContain('"whitelist":true');
-            expect(validationPipeStr).toContain('"forbidNonWhitelisted":true');
+            // Verificar las opciones individualmente
+            expect(validationPipe.validatorOptions.whitelist).toBe(true);
+            expect(validationPipe.validatorOptions.forbidNonWhitelisted).toBe(true);
+            expect(validationPipe.isTransformEnabled).toBe(true);
         });
     });
 
     describe('CORS Configuration', () => {
         it('should configure CORS with environment variables', async () => {
+            mockConfigService.get.mockImplementation((key: string) => {
+                if (key === 'CORS_ORIGIN') return 'http://localhost:3000';
+                return undefined;
+            });
+
             await bootstrap();
 
             expect(app.enableCors).toHaveBeenCalledWith({
-                origin: mockCorsOrigin,
+                origin: 'http://localhost:3000',
                 methods: 'GET,HEAD,PUT,PATCH,POST,DELETE',
                 credentials: true,
             });
         });
 
         it('should use default CORS origin when environment variable is not set', async () => {
-            delete process.env.CORS_ORIGIN;
+            mockConfigService.get.mockImplementation((key: string, defaultValue: any) => {
+                if (key === 'CORS_ORIGIN') return defaultValue;
+                return undefined;
+            });
+
             await bootstrap();
 
             expect(app.enableCors).toHaveBeenCalledWith({
@@ -135,13 +188,8 @@ describe('Bootstrap', () => {
                 .toHaveBeenCalledWith('1.0.0');
             expect(documentBuilder.addBearerAuth)
                 .toHaveBeenCalled();
-            expect(documentBuilder.build)
-                .toHaveBeenCalled();
-
             expect(SwaggerModule.createDocument)
                 .toHaveBeenCalledWith(app, expect.any(Object));
-
-            // Verificar que setup se llama con el documento creado
             expect(SwaggerModule.setup)
                 .toHaveBeenCalledWith('api/docs', app, swaggerDocument);
         });
@@ -149,21 +197,38 @@ describe('Bootstrap', () => {
 
     describe('Server Initialization', () => {
         it('should listen on configured port', async () => {
-            await bootstrap();
+            mockConfigService.get.mockImplementation((key: string) => {
+                if (key === 'PORT') return 3003;
+                return undefined;
+            });
 
-            expect(app.listen).toHaveBeenCalledWith(mockPort);
-            expect(console.log).toHaveBeenCalledWith(
-                `Application is running on: http://localhost:${mockPort}/api`
-            );
-        });
-
-        it('should use default port when PORT is not set', async () => {
-            delete process.env.PORT;
             await bootstrap();
 
             expect(app.listen).toHaveBeenCalledWith(3003);
             expect(console.log).toHaveBeenCalledWith(
-                'Application is running on: http://localhost:3003/api'
+                '🚀 HTTP server running on: http://localhost:3003/api'
+            );
+        });
+
+        it('should use default port when PORT is not set', async () => {
+            mockConfigService.get.mockImplementation((key: string, defaultValue: any) => {
+                if (key === 'PORT') return defaultValue;
+                return undefined;
+            });
+
+            await bootstrap();
+
+            expect(app.listen).toHaveBeenCalledWith(3003);
+            expect(console.log).toHaveBeenCalledWith(
+                '🚀 HTTP server running on: http://localhost:3003/api'
+            );
+        });
+
+        it('should log Swagger documentation URL', async () => {
+            await bootstrap();
+
+            expect(console.log).toHaveBeenCalledWith(
+                expect.stringContaining('📚 Swagger documentation available at:')
             );
         });
 

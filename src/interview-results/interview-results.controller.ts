@@ -1,5 +1,7 @@
-import { Body, Controller, Delete, Get, Param, Patch, Post } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Inject, Param, Patch, Post } from '@nestjs/common';
+import { ClientProxy, EventPattern, MessagePattern } from '@nestjs/microservices';
 import { ApiOperation, ApiResponse, ApiTags } from '@nestjs/swagger';
+import { firstValueFrom } from 'rxjs';
 import { CreateInterviewResultDto } from './dto/create-interview-result.dto';
 import { UpdateInterviewFeedbackDto } from './dto/update-interview-feedback.dto';
 import { UpdateInterviewRatingDto } from './dto/update-interview-rating.dto';
@@ -10,7 +12,10 @@ import { InterviewResultsService } from './interview-results.service';
 @ApiTags('Interview Results')
 @Controller('interview-results')
 export class InterviewResultsController {
-    constructor(private readonly resultsService: InterviewResultsService) { }
+    constructor(
+        private readonly resultsService: InterviewResultsService,
+        @Inject('INTERVIEW_RESULT_SERVICE') private readonly resultClient: ClientProxy,
+    ) { }
 
     @Post()
     @ApiOperation({ summary: 'Create a new interview result' })
@@ -19,8 +24,40 @@ export class InterviewResultsController {
         description: 'The interview result has been successfully created.',
         type: InterviewResult
     })
-    create(@Body() createDto: CreateInterviewResultDto) {
-        return this.resultsService.create(createDto);
+    async create(@Body() createDto: CreateInterviewResultDto) {
+        // Verificar si la entrevista existe
+        const interviewExists = await firstValueFrom(
+            this.resultClient.send('verify_interview', createDto.interview_id)
+        );
+
+        if (!interviewExists) {
+            throw new Error('Interview not found');
+        }
+
+        // Verificar si la pregunta existe
+        const questionExists = await firstValueFrom(
+            this.resultClient.send('verify_question', createDto.question_id)
+        );
+
+        if (!questionExists) {
+            throw new Error('Question not found');
+        }
+
+        const result = await this.resultsService.create(createDto);
+
+        // Emitir evento de resultado creado
+        this.resultClient.emit('interview_result_created', {
+            result,
+            timestamp: new Date(),
+        });
+
+        return result;
+    }
+
+    @EventPattern('interview_result_created')
+    async handleResultCreated(data: any) {
+        console.log('New interview result created:', data);
+        // Aquí puedes agregar lógica adicional para manejar el evento
     }
 
     @Get()
@@ -30,8 +67,8 @@ export class InterviewResultsController {
         description: 'List of all interview results',
         type: [InterviewResult]
     })
-    findAll() {
-        return this.resultsService.findAll();
+    async findAll() {
+        return await this.resultsService.findAll();
     }
 
     @Get(':id')
@@ -42,8 +79,8 @@ export class InterviewResultsController {
         type: InterviewResult
     })
     @ApiResponse({ status: 404, description: 'Interview result not found' })
-    findOne(@Param('id') id: string) {
-        return this.resultsService.findOne(id);
+    async findOne(@Param('id') id: string) {
+        return await this.resultsService.findOne(id);
     }
 
     @Get('interview/:interviewId')
@@ -53,8 +90,17 @@ export class InterviewResultsController {
         description: 'List of interview results for the specified interview',
         type: [InterviewResult]
     })
-    findByInterview(@Param('interviewId') interviewId: string) {
-        return this.resultsService.findByInterview(interviewId);
+    async findByInterview(@Param('interviewId') interviewId: string) {
+        // Verificar si la entrevista existe
+        const interviewExists = await firstValueFrom(
+            this.resultClient.send('verify_interview', interviewId)
+        );
+
+        if (!interviewExists) {
+            throw new Error('Interview not found');
+        }
+
+        return await this.resultsService.findByInterview(interviewId);
     }
 
     @Patch(':id')
@@ -65,19 +111,47 @@ export class InterviewResultsController {
         type: InterviewResult
     })
     @ApiResponse({ status: 404, description: 'Interview result not found' })
-    update(
+    async update(
         @Param('id') id: string,
         @Body() updateDto: UpdateInterviewResultDto
     ) {
-        return this.resultsService.update(id, updateDto);
+        const result = await this.resultsService.update(id, updateDto);
+
+        // Emitir evento de resultado actualizado
+        this.resultClient.emit('interview_result_updated', {
+            result,
+            timestamp: new Date(),
+        });
+
+        return result;
+    }
+
+    @EventPattern('interview_result_updated')
+    async handleResultUpdated(data: any) {
+        console.log('Interview result updated:', data);
+        // Aquí puedes agregar lógica adicional para manejar el evento
     }
 
     @Delete(':id')
     @ApiOperation({ summary: 'Delete an interview result' })
     @ApiResponse({ status: 200, description: 'The interview result has been successfully deleted.' })
     @ApiResponse({ status: 404, description: 'Interview result not found' })
-    remove(@Param('id') id: string) {
-        return this.resultsService.remove(id);
+    async remove(@Param('id') id: string) {
+        await this.resultsService.remove(id);
+
+        // Emitir evento de resultado eliminado
+        this.resultClient.emit('interview_result_deleted', {
+            result_id: id,
+            timestamp: new Date(),
+        });
+
+        return { message: 'Interview result deleted successfully' };
+    }
+
+    @EventPattern('interview_result_deleted')
+    async handleResultDeleted(data: any) {
+        console.log('Interview result deleted:', data);
+        // Aquí puedes agregar lógica adicional para manejar el evento
     }
 
     @Patch(':id/rating')
@@ -88,11 +162,26 @@ export class InterviewResultsController {
         type: InterviewResult
     })
     @ApiResponse({ status: 404, description: 'Interview result not found' })
-    updateRating(
+    async updateRating(
         @Param('id') id: string,
         @Body() ratingDto: UpdateInterviewRatingDto
     ) {
-        return this.resultsService.updateRating(id, ratingDto.rating);
+        const result = await this.resultsService.updateRating(id, ratingDto.rating);
+
+        // Emitir evento de calificación actualizada
+        this.resultClient.emit('interview_result_rating_updated', {
+            result_id: id,
+            rating: ratingDto.rating,
+            timestamp: new Date(),
+        });
+
+        return result;
+    }
+
+    @EventPattern('interview_result_rating_updated')
+    async handleRatingUpdated(data: any) {
+        console.log('Interview result rating updated:', data);
+        // Aquí puedes agregar lógica adicional para manejar el evento
     }
 
     @Patch(':id/feedback')
@@ -103,10 +192,36 @@ export class InterviewResultsController {
         type: InterviewResult
     })
     @ApiResponse({ status: 404, description: 'Interview result not found' })
-    updateAiFeedback(
+    async updateAiFeedback(
         @Param('id') id: string,
         @Body() feedbackDto: UpdateInterviewFeedbackDto
     ) {
-        return this.resultsService.updateAiFeedback(id, feedbackDto.ai_feedback);
+        const result = await this.resultsService.updateAiFeedback(id, feedbackDto.ai_feedback);
+
+        // Emitir evento de feedback actualizado
+        this.resultClient.emit('interview_result_feedback_updated', {
+            result_id: id,
+            feedback: feedbackDto.ai_feedback,
+            timestamp: new Date(),
+        });
+
+        return result;
+    }
+
+    @EventPattern('interview_result_feedback_updated')
+    async handleFeedbackUpdated(data: any) {
+        console.log('Interview result feedback updated:', data);
+        // Aquí puedes agregar lógica adicional para manejar el evento
+    }
+
+    // Manejador de mensajes para verificación de resultados
+    @MessagePattern('verify_result')
+    async verifyResult(resultId: string) {
+        try {
+            const result = await this.resultsService.findOne(resultId);
+            return { exists: !!result };
+        } catch (error) {
+            return { exists: false };
+        }
     }
 }

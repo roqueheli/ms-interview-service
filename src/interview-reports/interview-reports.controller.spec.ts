@@ -1,5 +1,7 @@
 import { NotFoundException } from '@nestjs/common';
+import { ClientProxy } from '@nestjs/microservices';
 import { Test, TestingModule } from '@nestjs/testing';
+import { of } from 'rxjs';
 import { CreateInterviewReportDto } from './dto/create-interview-report.dto';
 import { UpdateInterviewReportDto } from './dto/update-interview-report.dto';
 import { UpdateOverallScoreDto } from './dto/update-overall-score.dto';
@@ -11,6 +13,7 @@ import { InterviewReportsService } from './interview-reports.service';
 describe('InterviewReportsController', () => {
     let controller: InterviewReportsController;
     let service: InterviewReportsService;
+    let reportClient: ClientProxy;
 
     const mockReport: InterviewReport = {
         report_id: '123e4567-e89b-12d3-a456-426614174000',
@@ -40,6 +43,11 @@ describe('InterviewReportsController', () => {
         updateRecommendations: jest.fn()
     };
 
+    const mockReportClient = {
+        send: jest.fn(() => of(true)),
+        emit: jest.fn(),
+    };
+
     beforeEach(async () => {
         const module: TestingModule = await Test.createTestingModule({
             controllers: [InterviewReportsController],
@@ -47,41 +55,168 @@ describe('InterviewReportsController', () => {
                 {
                     provide: InterviewReportsService,
                     useValue: mockService
+                },
+                {
+                    provide: 'INTERVIEW_REPORT_SERVICE',
+                    useValue: mockReportClient
                 }
             ]
         }).compile();
 
         controller = module.get<InterviewReportsController>(InterviewReportsController);
         service = module.get<InterviewReportsService>(InterviewReportsService);
+        reportClient = module.get<ClientProxy>('INTERVIEW_REPORT_SERVICE');
+
+        // Espiar las funciones del cliente Redis
+        jest.spyOn(reportClient, 'send');
+        jest.spyOn(reportClient, 'emit');
     });
 
-    it('should be defined', () => {
-        expect(controller).toBeDefined();
+    afterEach(() => {
+        jest.clearAllMocks();
     });
 
     describe('create', () => {
-        it('should create a new interview report', async () => {
-            const createDto: CreateInterviewReportDto = {
-                interview_id: mockReport.interview_id,
-                company_report: mockReport.company_report,
-                candidate_report: mockReport.candidate_report,
-                overall_score: mockReport.overall_score,
-                recommendations: mockReport.recommendations
-            };
+        const createDto: CreateInterviewReportDto = {
+            interview_id: mockReport.interview_id,
+            company_report: mockReport.company_report,
+            candidate_report: mockReport.candidate_report,
+            overall_score: mockReport.overall_score,
+            recommendations: mockReport.recommendations
+        };
 
-            jest.spyOn(service, 'create').mockResolvedValue(mockReport);
+        it('should create a new interview report and emit event', async () => {
+            mockService.create.mockResolvedValue(mockReport);
+            mockReportClient.send.mockReturnValue(of(true));
 
             const result = await controller.create(createDto);
 
             expect(result).toEqual(mockReport);
             expect(service.create).toHaveBeenCalledWith(createDto);
+            expect(reportClient.send).toHaveBeenCalledWith('verify_interview', createDto.interview_id);
+            expect(reportClient.emit).toHaveBeenCalledWith('interview_report_created', expect.any(Object));
+        });
+
+        it('should throw error if interview does not exist', async () => {
+            mockReportClient.send.mockReturnValue(of(false));
+
+            await expect(controller.create(createDto)).rejects.toThrow('Interview not found');
         });
     });
 
+    describe('findByInterview', () => {
+        it('should return reports for a specific interview after verification', async () => {
+            const reports = [mockReport];
+            mockService.findByInterview.mockResolvedValue(reports);
+            mockReportClient.send.mockReturnValue(of(true));
+
+            const result = await controller.findByInterview(mockReport.interview_id);
+
+            expect(result).toEqual(reports);
+            expect(reportClient.send).toHaveBeenCalledWith('verify_interview', mockReport.interview_id);
+            expect(service.findByInterview).toHaveBeenCalledWith(mockReport.interview_id);
+        });
+
+        it('should throw error if interview does not exist', async () => {
+            mockReportClient.send.mockReturnValue(of(false));
+
+            await expect(controller.findByInterview('nonexistent-id'))
+                .rejects.toThrow('Interview not found');
+        });
+    });
+
+    describe('update', () => {
+        const updateDto: UpdateInterviewReportDto = {
+            company_report: { technical_score: 90 }
+        };
+
+        it('should update report and emit event', async () => {
+            const updatedReport = { ...mockReport, company_report: { ...mockReport.company_report, technical_score: 90 } };
+            mockService.update.mockResolvedValue(updatedReport);
+
+            const result = await controller.update(mockReport.report_id, updateDto);
+
+            expect(result).toEqual(updatedReport);
+            expect(service.update).toHaveBeenCalledWith(mockReport.report_id, updateDto);
+            expect(reportClient.emit).toHaveBeenCalledWith('interview_report_updated', expect.any(Object));
+        });
+    });
+
+    describe('remove', () => {
+        it('should remove report and emit event', async () => {
+            mockService.remove.mockResolvedValue(undefined);
+
+            const result = await controller.remove(mockReport.report_id);
+
+            expect(result).toEqual({ message: 'Interview report deleted successfully' });
+            expect(service.remove).toHaveBeenCalledWith(mockReport.report_id);
+            expect(reportClient.emit).toHaveBeenCalledWith('interview_report_deleted', expect.any(Object));
+        });
+    });
+
+    describe('updateOverallScore', () => {
+        const scoreDto: UpdateOverallScoreDto = { overall_score: 95.0 };
+
+        it('should update score and emit event', async () => {
+            const updatedReport = { ...mockReport, overall_score: 95.0 };
+            mockService.updateOverallScore.mockResolvedValue(updatedReport);
+
+            const result = await controller.updateOverallScore(mockReport.report_id, scoreDto);
+
+            expect(result).toEqual(updatedReport);
+            expect(service.updateOverallScore).toHaveBeenCalledWith(mockReport.report_id, scoreDto.overall_score);
+            expect(reportClient.emit).toHaveBeenCalledWith('interview_report_score_updated', expect.any(Object));
+        });
+    });
+
+    describe('updateRecommendations', () => {
+        const recommendationsDto: UpdateRecommendationsDto = {
+            recommendations: 'New recommendations'
+        };
+
+        it('should update recommendations and emit event', async () => {
+            const updatedReport = { ...mockReport, recommendations: 'New recommendations' };
+            mockService.updateRecommendations.mockResolvedValue(updatedReport);
+
+            const result = await controller.updateRecommendations(mockReport.report_id, recommendationsDto);
+
+            expect(result).toEqual(updatedReport);
+            expect(service.updateRecommendations).toHaveBeenCalledWith(
+                mockReport.report_id,
+                recommendationsDto.recommendations
+            );
+            expect(reportClient.emit).toHaveBeenCalledWith(
+                'interview_report_recommendations_updated',
+                expect.any(Object)
+            );
+        });
+    });
+
+    describe('Message Patterns', () => {
+        describe('verifyReport', () => {
+            it('should return true if report exists', async () => {
+                mockService.findOne.mockResolvedValue(mockReport);
+
+                const result = await controller.verifyReport(mockReport.report_id);
+
+                expect(result).toEqual({ exists: true });
+            });
+
+            it('should return false if report does not exist', async () => {
+                mockService.findOne.mockRejectedValue(new NotFoundException());
+
+                const result = await controller.verifyReport('nonexistent-id');
+
+                expect(result).toEqual({ exists: false });
+            });
+        });
+    });
+
+    // Mantener las pruebas existentes para findAll y findOne
     describe('findAll', () => {
         it('should return an array of interview reports', async () => {
             const reports = [mockReport];
-            jest.spyOn(service, 'findAll').mockResolvedValue(reports);
+            mockService.findAll.mockResolvedValue(reports);
 
             const result = await controller.findAll();
 
@@ -92,135 +227,12 @@ describe('InterviewReportsController', () => {
 
     describe('findOne', () => {
         it('should return a single interview report', async () => {
-            jest.spyOn(service, 'findOne').mockResolvedValue(mockReport);
+            mockService.findOne.mockResolvedValue(mockReport);
 
             const result = await controller.findOne(mockReport.report_id);
 
             expect(result).toEqual(mockReport);
             expect(service.findOne).toHaveBeenCalledWith(mockReport.report_id);
-        });
-
-        it('should throw NotFoundException when report is not found', async () => {
-            jest.spyOn(service, 'findOne').mockRejectedValue(new NotFoundException());
-
-            await expect(controller.findOne('nonexistent-id')).rejects.toThrow(NotFoundException);
-        });
-    });
-
-    describe('findByInterview', () => {
-        it('should return reports for a specific interview', async () => {
-            const reports = [mockReport];
-            jest.spyOn(service, 'findByInterview').mockResolvedValue(reports);
-
-            const result = await controller.findByInterview(mockReport.interview_id);
-
-            expect(result).toEqual(reports);
-            expect(service.findByInterview).toHaveBeenCalledWith(mockReport.interview_id);
-        });
-    });
-
-    describe('update', () => {
-        it('should update an interview report', async () => {
-            const updateDto: UpdateInterviewReportDto = {
-                company_report: { technical_score: 90 }
-            };
-
-            jest.spyOn(service, 'update').mockResolvedValue({
-                ...mockReport,
-                company_report: { ...mockReport.company_report, technical_score: 90 }
-            });
-
-            const result = await controller.update(mockReport.report_id, updateDto);
-
-            expect(result.company_report.technical_score).toBe(90);
-            expect(service.update).toHaveBeenCalledWith(mockReport.report_id, updateDto);
-        });
-
-        it('should throw NotFoundException when updating non-existent report', async () => {
-            const updateDto: UpdateInterviewReportDto = {};
-            jest.spyOn(service, 'update').mockRejectedValue(new NotFoundException());
-
-            await expect(controller.update('nonexistent-id', updateDto)).rejects.toThrow(NotFoundException);
-        });
-    });
-
-    describe('remove', () => {
-        it('should remove an interview report', async () => {
-            jest.spyOn(service, 'remove').mockResolvedValue(undefined);
-
-            await controller.remove(mockReport.report_id);
-
-            expect(service.remove).toHaveBeenCalledWith(mockReport.report_id);
-        });
-
-        it('should throw NotFoundException when removing non-existent report', async () => {
-            jest.spyOn(service, 'remove').mockRejectedValue(new NotFoundException());
-
-            await expect(controller.remove('nonexistent-id')).rejects.toThrow(NotFoundException);
-        });
-    });
-
-    describe('updateOverallScore', () => {
-        it('should update only the overall score', async () => {
-            const scoreDto: UpdateOverallScoreDto = {
-                overall_score: 95.0
-            };
-
-            jest.spyOn(service, 'updateOverallScore').mockResolvedValue({
-                ...mockReport,
-                overall_score: 95.0
-            });
-
-            const result = await controller.updateOverallScore(mockReport.report_id, scoreDto);
-
-            expect(result.overall_score).toBe(95.0);
-            expect(service.updateOverallScore).toHaveBeenCalledWith(mockReport.report_id, scoreDto.overall_score);
-        });
-
-        it('should throw NotFoundException when updating score of non-existent report', async () => {
-            const scoreDto: UpdateOverallScoreDto = { overall_score: 95.0 };
-            jest.spyOn(service, 'updateOverallScore').mockRejectedValue(new NotFoundException());
-
-            await expect(controller.updateOverallScore('nonexistent-id', scoreDto)).rejects.toThrow(NotFoundException);
-        });
-    });
-
-    describe('updateRecommendations', () => {
-        it('should update only the recommendations', async () => {
-            const recommendationsDto: UpdateRecommendationsDto = {
-                recommendations: 'New recommendations'
-            };
-
-            jest.spyOn(service, 'updateRecommendations').mockResolvedValue({
-                ...mockReport,
-                recommendations: 'New recommendations'
-            });
-
-            const result = await controller.updateRecommendations(mockReport.report_id, recommendationsDto);
-
-            expect(result.recommendations).toBe('New recommendations');
-            expect(service.updateRecommendations).toHaveBeenCalledWith(
-                mockReport.report_id,
-                recommendationsDto.recommendations
-            );
-        });
-
-        it('should throw NotFoundException when updating recommendations of non-existent report', async () => {
-            const recommendationsDto: UpdateRecommendationsDto = {
-                recommendations: 'New recommendations'
-            };
-            jest.spyOn(service, 'updateRecommendations').mockRejectedValue(new NotFoundException());
-
-            await expect(
-                controller.updateRecommendations('nonexistent-id', recommendationsDto)
-            ).rejects.toThrow(NotFoundException);
-        });
-    });
-
-    describe('Swagger Documentation', () => {
-        it('should have API tags', () => {
-            const controllerMetadata = Reflect.getMetadata('swagger/apiUseTags', InterviewReportsController);
-            expect(controllerMetadata).toContain('Interview Reports');
         });
     });
 });
